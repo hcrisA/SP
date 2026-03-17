@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """
-StereoPilot Training Script - Production Ready
+StereoPilot LoRA Training Script
 
-Enhanced training script with best practices from diffusion-pipe:
-- Optimized memory management
-- Robust error handling
-- Efficient data loading
-- Comprehensive logging
+Training script with LoRA (Low-Rank Adaptation) support for efficient fine-tuning.
+LoRA reduces trainable parameters by 99%+ while maintaining model performance.
+
+Key Benefits:
+- 100x less trainable parameters
+- Lower memory usage
+- Faster training
+- Preserves original model capabilities
+- Small checkpoint files (~MB instead of GB)
 
 Usage:
-    python train_optimized.py --config toml/infer.toml \\
-                             --train_dir ../SP_Data/mono_train \\
-                             --output_dir ../SP_Data/checkpoints
+    # Basic LoRA training (rank=4)
+    python train_lora.py --config toml/infer.toml \
+                         --train_dir ../SP_Data/mono_train \
+                         --output_dir ../SP_Data/checkpoints_lora
+    
+    # High-rank LoRA for better adaptation
+    python train_lora.py --config toml/infer.toml \
+                         --train_dir ../SP_Data/mono_train \
+                         --output_dir ../SP_Data/checkpoints_lora \
+                         --lora_rank 16
+    
+    # Resume from checkpoint
+    python train_lora.py --config toml/infer.toml \
+                         --train_dir ../SP_Data/mono_train \
+                         --output_dir ../SP_Data/checkpoints_lora \
+                         --resume_from_checkpoint checkpoint_epoch_005.pt
 """
 
 import os
@@ -23,7 +40,7 @@ import gc
 import toml
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -45,7 +62,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('training.log', mode='a')
+        logging.FileHandler('training_lora.log', mode='a')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -56,6 +73,7 @@ sys.path.insert(0, str(project_root.parent))
 
 from models.StereoPilot import StereoPilotPipeline
 from utils.common import DTYPE_MAP
+from lora_utils import LoRAManager, create_lora_config
 
 # Import amp from the correct location for compatibility
 try:
@@ -64,14 +82,19 @@ except ImportError:
     from torch.cuda import amp
 
 
-def bind_custom_forward(model):
+def bind_custom_forward(model, use_gradient_checkpointing=False):
     """
     Bind custom forward method to model that accepts domain_label parameter.
     
     This is needed because the original WanModel.forward() does not accept domain_label,
     but StereoPilot requires it for domain adaptation.
+    
+    Args:
+        model: The WanModel instance
+        use_gradient_checkpointing: If True, use gradient checkpointing to save memory
     """
     from models.wan import sinusoidal_embedding_1d
+    from torch.utils.checkpoint import checkpoint
     
     # Use closure to capture model - this avoids the MethodType binding issue
     # where 'self' would be passed as first argument
@@ -137,8 +160,14 @@ def bind_custom_forward(model):
             context_lens=None
         )
 
-        for block in model.blocks:
-            x = block(x, **kwargs)
+        # Use gradient checkpointing if enabled
+        if use_gradient_checkpointing and model.training:
+            for block in model.blocks:
+                # Use checkpoint for each block to save memory
+                x = checkpoint(block, x, use_reentrant=False, **kwargs)
+        else:
+            for block in model.blocks:
+                x = block(x, **kwargs)
 
         x = model.head(x, e)
         x = model.unpatchify(x, grid_sizes)
@@ -147,6 +176,19 @@ def bind_custom_forward(model):
     # Directly assign the closure function (not MethodType)
     # The closure captures 'model' internally, so no self binding needed
     model.forward = custom_forward
+
+
+@dataclass
+class LoRAConfig:
+    """LoRA-specific configuration."""
+    rank: int = 4
+    alpha: Optional[float] = None
+    dropout: float = 0.0
+    target_modules: Optional[List[str]] = None
+    
+    def __post_init__(self):
+        if self.alpha is None:
+            self.alpha = self.rank
 
 
 @dataclass
@@ -166,6 +208,10 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     save_every_n_epochs: int = 1
     log_every_n_steps: int = 50
+    
+    # LoRA configuration
+    lora_config: LoRAConfig = field(default_factory=LoRAConfig)
+    resume_from_checkpoint: Optional[str] = None
 
 
 class StereoVideoDataset(Dataset):
@@ -352,12 +398,12 @@ class StereoVideoDataset(Dataset):
 
 class Trainer:
     """
-    Main trainer class for StereoPilot with production-quality features.
+    Main trainer class for StereoPilot LoRA with production-quality features.
     
     Handles:
-    - Model initialization and setup
+    - Model initialization with LoRA injection
     - Memory-efficient training with gradient checkpointing
-    - Robust checkpoint saving and resuming
+    - Robust checkpoint saving and resuming (LoRA weights only)
     - Comprehensive logging and monitoring
     """
     
@@ -400,9 +446,10 @@ class Trainer:
         # Training state
         self.global_step = 0
         self.best_loss = float('inf')
+        self.start_epoch = 0
         
         logger.info("="*80)
-        logger.info("StereoPilot Training Configuration")
+        logger.info("StereoPilot LoRA Training Configuration")
         logger.info("="*80)
         logger.info(f"Output directory: {self.output_dir}")
         logger.info(f"Batch size: {config.batch_size}")
@@ -410,11 +457,14 @@ class Trainer:
         logger.info(f"Epochs: {config.num_epochs}")
         logger.info(f"Gradient accumulation: {config.gradient_accumulation_steps}")
         logger.info(f"Mixed precision: {config.mixed_precision}")
+        logger.info(f"LoRA rank: {config.lora_config.rank}")
+        logger.info(f"LoRA alpha: {config.lora_config.alpha}")
+        logger.info(f"LoRA dropout: {config.lora_config.dropout}")
         logger.info(f"Accelerator config: {self.accelerator.state}")
         logger.info("="*80)
     
     def setup_model(self):
-        """Load and configure the model with proper memory management."""
+        """Load and configure the model with LoRA injection."""
         if self.accelerator.is_main_process:
             logger.info("Loading model configuration...")
         
@@ -423,7 +473,6 @@ class Trainer:
             model_config = json.loads(json.dumps(toml.load(f)))
         
         # Override dtypes for training based on mixed precision setting
-        # Note: Keep as string here, will be converted to torch.dtype via DTYPE_MAP
         if self.accelerator.mixed_precision == "bf16":
             model_config['model']['dtype'] = 'bfloat16'
             model_config['model']['transformer_dtype'] = 'bfloat16'
@@ -431,7 +480,7 @@ class Trainer:
             model_config['model']['dtype'] = 'float16'
             model_config['model']['transformer_dtype'] = 'float16'
         
-        # Convert dtype strings to torch.dtype using DTYPE_MAP (like evaluate.py does)
+        # Convert dtype strings to torch.dtype using DTYPE_MAP
         model_config['model']['dtype'] = DTYPE_MAP[model_config['model']['dtype']]
         if 'transformer_dtype' in model_config['model']:
             model_config['model']['transformer_dtype'] = DTYPE_MAP[model_config['model']['transformer_dtype']]
@@ -446,10 +495,29 @@ class Trainer:
         self.text_encoder = self.pipeline.text_encoder
         
         # Bind custom forward method that accepts domain_label parameter
-        # This is essential for StereoPilot domain adaptation
-        bind_custom_forward(self.transformer)
+        # Enable gradient checkpointing to save memory
+        bind_custom_forward(self.transformer, use_gradient_checkpointing=True)
         if self.accelerator.is_main_process:
-            logger.info("✓ Custom forward method bound to transformer (supports domain_label)")
+            logger.info("✓ Custom forward method bound to transformer (supports domain_label + gradient checkpointing)")
+        
+        # Initialize LoRA manager and inject LoRA layers
+        lora_dtype = model_config['model'].get('transformer_dtype', model_config['model']['dtype'])
+        self.lora_manager = LoRAManager(
+            model=self.transformer,
+            rank=self.config.lora_config.rank,
+            alpha=self.config.lora_config.alpha,
+            dropout=self.config.lora_config.dropout,
+            dtype=lora_dtype,
+            target_modules=self.config.lora_config.target_modules
+        )
+        
+        # Inject LoRA into transformer
+        injected_count = self.lora_manager.inject_lora()
+        if self.accelerator.is_main_process:
+            logger.info(f"✓ Injected {injected_count} LoRA modules")
+        
+        # Freeze all original weights, only LoRA parameters are trainable
+        self.lora_manager.freeze_original_weights()
         
         # Freeze VAE (both encoder and decoder)
         if hasattr(self.vae, 'model'):
@@ -471,30 +539,13 @@ class Trainer:
         if self.accelerator.is_main_process:
             logger.info("✓ Text Encoder (UMT5) frozen")
         
-        # Enable gradient checkpointing for memory efficiency if supported
-        try:
-            if hasattr(self.transformer, 'enable_gradient_checkpointing'):
-                self.transformer.enable_gradient_checkpointing()
-                if self.accelerator.is_main_process:
-                    logger.info("✓ Gradient checkpointing enabled")
-            elif hasattr(self.transformer, 'gradient_checkpointing_enable'):
-                self.transformer.gradient_checkpointing_enable()
-                if self.accelerator.is_main_process:
-                    logger.info("✓ Gradient checkpointing enabled (HF API)")
-        except Exception as e:
-            logger.warning(f"Could not enable gradient checkpointing: {e}")
-        
-        # Set transformer to training mode (only trainable component)
-        self.transformer.requires_grad_(True)
+        # Set transformer to training mode (LoRA parameters are trainable)
         self.transformer.train()
         
-        if self.accelerator.is_main_process:
-            logger.info("✓ Transformer set to trainable")
-        
-        # Count parameters
+        # Log parameter counts
         self._log_parameter_counts()
         
-        # Move VAE to device for encoding (will be moved back to CPU after precomputation)
+        # Move VAE to device for encoding
         device = self.accelerator.device
         if hasattr(self.vae, 'model'):
             self.vae.model.to(device)
@@ -505,7 +556,7 @@ class Trainer:
             return
         
         def count_params(model, name):
-            # Handle wrapped models (VAE, TextEncoder have .model attribute)
+            # Handle wrapped models
             if hasattr(model, 'model') and hasattr(model.model, 'parameters'):
                 actual_model = model.model
             else:
@@ -515,6 +566,8 @@ class Trainer:
                 total = sum(p.numel() for p in actual_model.parameters())
                 trainable = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
                 frozen = total - trainable
+                
+                # Format numbers with commas
                 logger.info(
                     f"  {name}: {total:,} total, {trainable:,} trainable, {frozen:,} frozen"
                 )
@@ -540,10 +593,15 @@ class Trainer:
         total_trainable += tr
         
         if total_params > 0:
+            trainable_pct = 100 * total_trainable / total_params
             logger.info(
                 f"  Total: {total_params:,} parameters, "
-                f"{total_trainable:,} trainable ({100*total_trainable/total_params:.1f}%)"
+                f"{total_trainable:,} trainable ({trainable_pct:.2f}%)"
             )
+            
+            # Calculate LoRA-specific stats
+            lora_params = len(self.lora_manager.get_trainable_parameters())
+            logger.info(f"  LoRA parameters: {lora_params:,}")
     
     def setup_data(self):
         """Setup data loaders with optimized settings."""
@@ -577,15 +635,18 @@ class Trainer:
             )
     
     def setup_optimizer(self):
-        """Setup optimizer and scheduler with proper configuration."""
+        """Setup optimizer and scheduler for LoRA parameters."""
         if self.accelerator.is_main_process:
-            logger.info("Setting up optimizer...")
+            logger.info("Setting up optimizer for LoRA parameters...")
         
-        # Filter trainable parameters
-        trainable_params = [p for p in self.transformer.parameters() if p.requires_grad]
+        # Get only LoRA trainable parameters
+        trainable_params = self.lora_manager.get_trainable_parameters()
         
         if not trainable_params:
-            raise ValueError("No trainable parameters found! Check model configuration.")
+            raise ValueError("No LoRA trainable parameters found! Check LoRA configuration.")
+        
+        if self.accelerator.is_main_process:
+            logger.info(f"  Found {len(trainable_params)} LoRA parameter groups")
         
         # Create AdamW optimizer with Kahan summation for stability
         self.optimizer = torch.optim.AdamW(
@@ -594,23 +655,22 @@ class Trainer:
             betas=(0.9, 0.999),
             weight_decay=1e-2,
             eps=1e-8,
-            fused=True if torch.cuda.is_available() else False  # Use fused optimizer if available
+            fused=True if torch.cuda.is_available() else False
         )
         
         # Create learning rate scheduler
-        # Cosine annealing with warm restarts for better convergence
         total_steps = self.config.num_epochs * len(self.train_loader) // self.config.gradient_accumulation_steps
         
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_0=max(100, total_steps // 10),  # First restart after 10% of training
-            T_mult=2,  # Double the interval after each restart
+            T_0=max(100, total_steps // 10),
+            T_mult=2,
             eta_min=self.config.learning_rate * 0.1
         )
         
         if self.accelerator.is_main_process:
             logger.info(
-                f"✓ AdamW optimizer initialized (lr={self.config.learning_rate}, "
+                f"✓ AdamW optimizer initialized for LoRA (lr={self.config.learning_rate}, "
                 f"weight_decay=1e-2)"
             )
             logger.info(
@@ -756,10 +816,10 @@ class Trainer:
         mse_loss = F.mse_loss(pred_latents, target_latents)
         
         # L1 loss for sparsity (optional, can help with generalization)
-        l1_loss = F.l1_loss(pred_latents, target_latents)
+        # l1_loss = F.l1_loss(pred_latents, target_latents)
         
         # Combined loss (you can adjust the weighting)
-        total_loss = mse_loss + 0.1 * l1_loss
+        total_loss = mse_loss # + 0.1 * l1_loss
         
         return total_loss
     
@@ -778,16 +838,48 @@ class Trainer:
         batch_size = left_video.shape[0]
         
         # Clear cache before forward pass
-        if self.global_step % 10 == 0:
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
+        
+        # Move VAE to GPU if not already
+        device = self.accelerator.device
+        if hasattr(self.vae, 'model'):
+            # Check device by looking at first parameter (WanVAE_ doesn't have .device attribute)
+            try:
+                vae_device = next(self.vae.model.parameters()).device
+                if vae_device != device:
+                    self.vae.model.to(device)
+            except StopIteration:
+                # No parameters, just try to move
+                self.vae.model.to(device)
         
         # Encode videos to latents (memory-intensive, done with no_grad)
+        left_latents = None
+        right_latents = None
         try:
             with torch.no_grad():
                 left_latents, right_latents = self.encode_videos(left_video, right_video)
         except Exception as e:
+            import traceback
             logger.error(f"Error encoding videos: {e}")
+            logger.error(traceback.format_exc())
+            # Move VAE back to CPU to free memory
+            if hasattr(self.vae, 'model'):
+                self.vae.model.to('cpu')
+            torch.cuda.empty_cache()
             return 0.0, {"loss": 0.0, "mse_loss": 0.0}
+        
+        # Verify latents were computed
+        if left_latents is None or right_latents is None:
+            logger.error("Latents were not computed properly")
+            if hasattr(self.vae, 'model'):
+                self.vae.model.to('cpu')
+            torch.cuda.empty_cache()
+            return 0.0, {"loss": 0.0, "mse_loss": 0.0}
+        
+        # Move VAE to CPU immediately after encoding to save memory
+        if hasattr(self.vae, 'model'):
+            self.vae.model.to('cpu')
+        torch.cuda.empty_cache()
         
         # Check for NaNs in latents
         if torch.isnan(left_latents).any() or torch.isnan(right_latents).any():
@@ -841,19 +933,22 @@ class Trainer:
                 return 0.0, {"loss": 0.0, "mse_loss": 0.0}
         
         # Clear intermediate tensors
-        del left_latents, right_latents, pred_latents_list
+        # Note: Don't delete right_latents here, it's needed for metrics
         
         metrics = {
             "loss": loss.item(),
-            "mse_loss": F.mse_loss(pred_latents, right_latents).item() if 'pred_latents' in locals() else 0.0
+            "mse_loss": F.mse_loss(pred_latents, right_latents).item() if pred_latents is not None and right_latents is not None else 0.0
         }
+        
+        # Clean up
+        del left_latents, right_latents, pred_latents_list, pred_latents
         
         return loss, metrics
     
     def train(self):
         """Main training loop with comprehensive logging and monitoring."""
         if self.accelerator.is_main_process:
-            logger.info("Starting training...")
+            logger.info("Starting LoRA training...")
             start_time = time.time()
         
         # Setup
@@ -861,6 +956,10 @@ class Trainer:
         self.setup_data()
         self.setup_optimizer()
         self.precompute_text_embeddings()
+        
+        # Resume from checkpoint if specified
+        if self.config.resume_from_checkpoint:
+            self.load_checkpoint(self.config.resume_from_checkpoint)
         
         # Prepare with accelerator
         self.transformer, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
@@ -874,7 +973,7 @@ class Trainer:
         if self.accelerator.is_main_process:
             logger.info(f"Starting training for {self.config.num_epochs} epochs ({steps_per_epoch} steps per epoch)")
         
-        for epoch in range(self.config.num_epochs):
+        for epoch in range(self.start_epoch, self.config.num_epochs):
             if self.accelerator.is_main_process:
                 logger.info("\n" + "="*80)
                 logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
@@ -897,6 +996,9 @@ class Trainer:
                 batch_start = time.time()
                 
                 # Training step with gradient accumulation
+                loss = None
+                metrics = None
+                
                 with self.accelerator.accumulate(self.transformer):
                     try:
                         loss, metrics = self.train_step(batch)
@@ -925,7 +1027,10 @@ class Trainer:
                         logger.error(f"Error in training step at batch {batch_idx}: {e}")
                         continue
                 
-                # Update metrics
+                # Skip if metrics was not set (failed batch)
+                if metrics is None:
+                    continue
+                    
                 loss_value = metrics["loss"]
                 epoch_loss += loss_value
                 total_loss += loss_value
@@ -1003,7 +1108,7 @@ class Trainer:
         if self.accelerator.is_main_process:
             total_time = time.time() - start_time
             logger.info("\n" + "="*80)
-            logger.info("Training completed!")
+            logger.info("LoRA Training completed!")
             logger.info("="*80)
             
             avg_total_loss = total_loss / self.global_step if self.global_step > 0 else 0
@@ -1017,7 +1122,11 @@ class Trainer:
             self.save_checkpoint(self.config.num_epochs - 1, avg_total_loss, is_best=True)
     
     def save_checkpoint(self, epoch: int, loss: float, is_best: bool = False):
-        """Save model checkpoint with both full state and weights."""
+        """Save model checkpoint with both full state and LoRA weights."""
+        # Only save on main process
+        if not self.accelerator.is_main_process:
+            return
+        
         # Unwrap model
         unwrapped_model = self.accelerator.unwrap_model(self.transformer)
         
@@ -1025,7 +1134,12 @@ class Trainer:
         checkpoint_data = {
             'epoch': epoch + 1,
             'global_step': self.global_step,
-            'model_state_dict': unwrapped_model.state_dict(),
+            'lora_config': {
+                'rank': self.config.lora_config.rank,
+                'alpha': self.config.lora_config.alpha,
+                'dropout': self.config.lora_config.dropout,
+                'target_modules': self.config.lora_config.target_modules
+            },
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'loss': loss,
@@ -1033,35 +1147,73 @@ class Trainer:
             'config': self.config.__dict__
         }
         
-        # Save regular checkpoint
+        # Save regular checkpoint (only LoRA weights, much smaller!)
         if (epoch + 1) % self.config.save_every_n_epochs == 0:
+            # Save full checkpoint with optimizer state
             checkpoint_path = self.output_dir / f"checkpoint_epoch_{epoch + 1:03d}.pt"
             torch.save(checkpoint_data, checkpoint_path)
             logger.info(f"Checkpoint saved: {checkpoint_path}")
-        
-        # Save weights in safetensors format (more efficient)
-        weights_path = self.output_dir / f"stereopilot_epoch_{epoch + 1:03d}.safetensors"
-        safetensors.torch.save_file(unwrapped_model.state_dict(), weights_path)
-        logger.info(f"Weights saved: {weights_path}")
+            
+            # Save only LoRA weights (small file)
+            lora_state_dict = self.lora_manager.get_lora_state_dict()
+            lora_weights_path = self.output_dir / f"lora_weights_epoch_{epoch + 1:03d}.safetensors"
+            safetensors.torch.save_file(lora_state_dict, lora_weights_path)
+            logger.info(f"LoRA weights saved: {lora_weights_path} (size: ~{sum(p.numel() for p in lora_state_dict.values()) * 2 / 1024**2:.1f} MB)")
         
         # Save best model
         if is_best:
             best_checkpoint_path = self.output_dir / "best_checkpoint.pt"
-            best_weights_path = self.output_dir / "best_model.safetensors"
+            best_lora_path = self.output_dir / "best_lora.safetensors"
             
             torch.save(checkpoint_data, best_checkpoint_path)
-            safetensors.torch.save_file(unwrapped_model.state_dict(), best_weights_path)
             
-            logger.info(f"Best model saved (loss: {loss:.6f})")
+            lora_state_dict = self.lora_manager.get_lora_state_dict()
+            safetensors.torch.save_file(lora_state_dict, best_lora_path)
+            
+            logger.info(f"Best LoRA model saved (loss: {loss:.6f})")
+            logger.info(f"  LoRA weights size: ~{sum(p.numel() for p in lora_state_dict.values()) * 2 / 1024**2:.1f} MB")
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load checkpoint and resume training."""
+        if not self.accelerator.is_main_process:
+            return
+        
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Load training state
+        self.start_epoch = checkpoint['epoch']
+        self.global_step = checkpoint['global_step']
+        self.best_loss = checkpoint['best_loss']
+        
+        # Load LoRA weights into model
+        if 'model_state_dict' in checkpoint:
+            # Full checkpoint with model state
+            self.transformer.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            # Load only LoRA weights
+            lora_state_dict = checkpoint.get('lora_state_dict', None)
+            if lora_state_dict is None:
+                logger.error("No model state dict found in checkpoint")
+                return
+            self.lora_manager.load_lora_state_dict(lora_state_dict)
+        
+        # Load optimizer and scheduler
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        logger.info(f"✓ Resumed from epoch {self.start_epoch}, step {self.global_step}, best loss {self.best_loss:.6f}")
 
 
 def parse_args() -> TrainingConfig:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Train StereoPilot model for stereo video conversion",
+        description="Train StereoPilot model with LoRA for stereo video conversion",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
+    # Standard training arguments
     parser.add_argument(
         "--config", 
         type=str, 
@@ -1077,7 +1229,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument(
         "--output_dir", 
         type=str, 
-        default="../SP_Data/checkpoints",
+        default="../SP_Data/checkpoints_lora",
         help="Path to save checkpoints"
     )
     parser.add_argument(
@@ -1142,10 +1294,55 @@ def parse_args() -> TrainingConfig:
         help="Log to tensorboard every N steps"
     )
     
+    # LoRA-specific arguments
+    parser.add_argument(
+        "--lora_rank", 
+        type=int, 
+        default=4,
+        help="LoRA rank (higher=more expressive, more params). Typical: 4-32"
+    )
+    parser.add_argument(
+        "--lora_alpha", 
+        type=float, 
+        default=None,
+        help="LoRA alpha scaling (defaults to lora_rank)"
+    )
+    parser.add_argument(
+        "--lora_dropout", 
+        type=float, 
+        default=0.0,
+        help="LoRA dropout rate (0.0-0.1)"
+    )
+    parser.add_argument(
+        "--lora_target_modules", 
+        type=str, 
+        default=None,
+        help="Comma-separated list of target modules (e.g., 'attn.q,attn.k,attn.v,ffn.fc1')"
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint", 
+        type=str, 
+        default=None,
+        help="Path to checkpoint to resume from"
+    )
+    
     args = parser.parse_args()
     
     # Parse image size
     width, height = map(int, args.image_size.split(','))
+    
+    # Parse LoRA target modules
+    target_modules = None
+    if args.lora_target_modules:
+        target_modules = args.lora_target_modules.split(',')
+    
+    # Create LoRA config
+    lora_config = LoRAConfig(
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
+        target_modules=target_modules
+    )
     
     return TrainingConfig(
         config_path=args.config,
@@ -1160,7 +1357,9 @@ def parse_args() -> TrainingConfig:
         image_size=(width, height),
         seed=args.seed,
         save_every_n_epochs=args.save_every_n_epochs,
-        log_every_n_steps=args.log_every_n_steps
+        log_every_n_steps=args.log_every_n_steps,
+        lora_config=lora_config,
+        resume_from_checkpoint=args.resume_from_checkpoint
     )
 
 
@@ -1179,7 +1378,7 @@ def main():
         sys.exit(1)
     
     # Log configuration
-    logger.info("Starting StereoPilot Training")
+    logger.info("Starting StereoPilot LoRA Training")
     logger.info(f"Config: {config}")
     
     # Create trainer
