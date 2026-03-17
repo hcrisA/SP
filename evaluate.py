@@ -167,8 +167,8 @@ def set_config_defaults(config):
 def main():
     parser = argparse.ArgumentParser(description="StereoPilot Evaluation on Mono2Stereo")
     parser.add_argument("--config", type=str, default="toml/infer.toml", help="Config file path")
-    parser.add_argument("--data_root", type=str, default="/root/autodl-tmp/mono2stereo", help="Root of Mono2Stereo dataset")
-    parser.add_argument("--output_folder", type=str, default="mono_test", help="Output directory name")
+    parser.add_argument("--data_root", type=str, default="../SP_Data/mono2stereo_test", help="Root of Mono2Stereo dataset")
+    parser.add_argument("--output_folder", type=str, default="../SP_Data/test_vis_output", help="Output directory name")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--logs_dir", type=str, default="logs", help="Logs directory")
     args = parser.parse_args()
@@ -178,7 +178,7 @@ def main():
     os.makedirs(output_root, exist_ok=True)
     os.makedirs(args.logs_dir, exist_ok=True)
     
-    log_file_path = os.path.join(args.logs_dir, 'evaluation_results.txt')
+    log_file_path = os.path.join(args.logs_dir, '../SP_Data/logs/evaluation_results.txt')
 
     print(f"Loading config from {args.config}")
     if not os.path.exists(args.config):
