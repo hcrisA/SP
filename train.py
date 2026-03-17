@@ -1,581 +1,946 @@
+#!/usr/bin/env python3
+"""
+StereoPilot Training Script - Optimized for Memory Efficiency
+
+This script trains StereoPilot model for stereo video conversion using reconstruction loss.
+Key features:
+- Memory-efficient training with gradient checkpointing and mixed precision
+- GPU-optimized data loading and processing
+- Clean architecture following the original StereoPilot paper
+
+Usage:
+    python train.py --config toml/infer.toml \
+                    --train_dir ../SP_Data/mono_train \
+                    --output_dir ../SP_Data/checkpoints
+"""
+
 import os
+import sys
 import argparse
-import random
 import json
 import toml
-import glob
-import sys
-import types
-from typing import List
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-from torchvision.io import read_video
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.checkpoint import checkpoint
+
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-import re
-from accelerate import init_empty_weights
-from accelerate.utils import set_module_tensor_to_device
-from safetensors.torch import load_file
-import torch.cuda.amp as amp
-from PIL import Image
+from tqdm import tqdm
+import logging
 
-# Add current directory to path
-sys.path.append(os.getcwd())
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('training.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Import Wan Modules
-import models.wan
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
-# Patch WanPipeline.__init__ to avoid hardcoded cuda calls which fail on unsupported devices (e.g. RTX 5090 with PyTorch < 2.5)
-import inspect
-import textwrap
-try:
-    init_src = inspect.getsource(models.wan.WanPipeline.__init__)
-    init_src = textwrap.dedent(init_src)
-    # Comment out hardcoded cuda transfers
-    init_src = init_src.replace("self.vae.mean = self.vae.mean.to('cuda')", "# self.vae.mean = self.vae.mean.to('cuda')")
-    init_src = init_src.replace("self.vae.std = self.vae.std.to('cuda')", "# self.vae.std = self.vae.std.to('cuda')")
-    
-    exec_globals = models.wan.WanPipeline.__init__.__globals__
-    # Execute the modified source in the original globals
-    exec(init_src, exec_globals)
-    # Update the class method
-    models.wan.WanPipeline.__init__ = exec_globals['__init__']
-    print("Successfully patched WanPipeline.__init__ to remove hardcoded cuda calls")
-except Exception as e:
-    print(f"Failed to patch WanPipeline: {e}")
-
-from models.wan import KEEP_IN_HIGH_PRECISION, sinusoidal_embedding_1d
-
-# Patch WanAttentionBlock.forward to fix RMSNorm float32 output issue with bfloat16 weights
-# This prevents "RuntimeError: mat1 and mat2 must have the same dtype"
-try:
-    if hasattr(models.wan, 'WanAttentionBlock'):
-        def patched_forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
-            # Ensure modulation matches input dtype (e is from e0 which is bfloat16)
-            e = (self.modulation.to(x.dtype) + e).chunk(6, dim=1)
-            
-            # 1. Self Attention with casted Norm
-            # self.norm1 likely returns float32. We need bfloat16 for self_attn weights.
-            normed_x = self.norm1(x).to(x.dtype)
-            y = self.self_attn(normed_x * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs)
-            x = x + y * e[2]
-
-            # 2. Cross Attention
-            normed_x3 = self.norm3(x).to(x.dtype)
-            # context might be different dtype? Ensure it matches if needed, but cross_attn usually handles context.
-            # But x must match weights.
-            x = x + self.cross_attn(normed_x3, context, context_lens)
-
-            # 3. FFN
-            normed_x2 = self.norm2(x).to(x.dtype)
-            y = self.ffn(normed_x2 * (1 + e[4]) + e[3])
-            x = x + y * e[5]
-            return x
-            
-        models.wan.WanAttentionBlock.forward = patched_forward
-        print("Successfully patched WanAttentionBlock.forward for bfloat16 training stability")
-except Exception as e:
-    print(f"Failed to patch WanAttentionBlock: {e}")
-
-# Patch WanSelfAttention.forward to fix float output from flash_attn/rope mismatching with bfloat16 linear layer
-try:
-    from wan.modules.model import rope_apply, WanSelfAttention 
-    from wan.modules.attention import flash_attention
-    
-    def patched_sa_forward(self, x, seq_lens, grid_sizes, freqs):
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
-
-        q, k, v = qkv_fn(x)
-
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs), 
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
-
-        x = x.flatten(2)
-        
-        # FIX: Ensure x matches linear layer weight dtype
-        if x.dtype != self.o.weight.dtype:
-            x = x.to(self.o.weight.dtype)
-            
-        x = self.o(x)
-        return x
-
-    WanSelfAttention.forward = patched_sa_forward
-    print("Successfully patched WanSelfAttention.forward for bfloat16 stability")
-except Exception as e:
-    print(f"Failed to patch WanSelfAttention: {e}")
-
-# Patch WanLayerNorm.forward to avoid casting input to float32 when weights are bfloat16
-try:
-    if hasattr(models.wan, 'WanLayerNorm'):
-        def patched_ln_forward(self, x):
-             # Original WanLayerNorm implementation casts input to float32: super().forward(x.float()).type_as(x)
-             # This causes error if weights are bfloat16.
-             # We just run in original dtype (bfloat16).
-             return super(models.wan.WanLayerNorm, self).forward(x)
-        
-        models.wan.WanLayerNorm.forward = patched_ln_forward
-        print("Successfully patched WanLayerNorm.forward for bfloat16 stability")
-except Exception as e:
-    print(f"Failed to patch WanLayerNorm: {e}")
-
-# Now import StereoPilot (it uses models.wan)
 from models.StereoPilot import StereoPilotPipeline
-import models.StereoPilot
 
-# Patch StereoPilotPipeline.__init__ to convert string dtypes to torch.dtype objects
-# This fixes: RuntimeError: Invalid device string: 'bfloat16'
-def _dtype_converter_wrapper(init_func):
-    def wrapper(self, config):
-        def parse_dtype(name):
-            if not isinstance(name, str): return name
-            if name == 'float8':
-                return getattr(torch, 'float8_e4m3fn', torch.float16)
-            if hasattr(torch, name):
-                return getattr(torch, name)
-            # Try to handle 'bfloat16' specifically just in case
-            if name == 'bfloat16': return torch.bfloat16
-            return torch.float32 # fallback
-
-        if 'model' in config:
-            if 'dtype' in config['model']:
-                config['model']['dtype'] = parse_dtype(config['model']['dtype'])
-            if 'transformer_dtype' in config['model']:
-                config['model']['transformer_dtype'] = parse_dtype(config['model']['transformer_dtype'])
-        
-        return init_func(self, config)
-    return wrapper
-
-# Apply patch
-StereoPilotPipeline.__init__ = _dtype_converter_wrapper(StereoPilotPipeline.__init__)
-print("Successfully patched StereoPilotPipeline to handle string dtypes")
-
-# Patch StereoPilotPipeline.load_diffusion_model to remove hardcoded cuda device
-try:
-    load_src = inspect.getsource(StereoPilotPipeline.load_diffusion_model)
-    load_src = textwrap.dedent(load_src)
-    # Removing hardcoded cuda
-    load_src = load_src.replace('device="cuda"', 'device="cpu"') 
-    
-    # Execute in the module's globals
-    sp_globals = StereoPilotPipeline.load_diffusion_model.__globals__
-    exec(load_src, sp_globals)
-    StereoPilotPipeline.load_diffusion_model = sp_globals['load_diffusion_model']
-    print("Successfully patched StereoPilotPipeline.load_diffusion_model")
-except Exception as e:
-    print(f"Failed to patch StereoPilotPipeline.load_diffusion_model: {e}")
-
-# =============================================================================
-# 2. Dataset
-# =============================================================================
 
 class StereoVideoDataset(Dataset):
-    def __init__(self, root_dir, width=832, height=480, frames=81):
-        self.left_dir = os.path.join(root_dir, 'left')
-        self.right_dir = os.path.join(root_dir, 'right')
-        self.width = width
-        self.height = height
-        self.frames = frames
+    """
+    Stereo video dataset for training.
+    
+    Loads left/right image pairs and returns 81-frame sequences.
+    Images are expected in the format: mono_train/left/*.jpg, mono_train/right/*.jpg
+    """
+    
+    def __init__(
+        self,
+        root_dir: str,
+        num_frames: int = 81,
+        image_size: Tuple[int, int] = (832, 480),
+        extensions: tuple = ('.jpg', '.jpeg', '.png', '.bmp'),
+        validation_mode: bool = True
+    ):
+        """
+        Args:
+            root_dir: Root directory containing 'left' and 'right' subfolders
+            num_frames: Number of frames per video sequence (81 as per paper)
+            image_size: Target image size (width, height)
+            extensions: Valid image file extensions
+            validation_mode: Whether to validate image loading
+        """
+        self.root_dir = Path(root_dir)
+        self.num_frames = num_frames
+        self.image_size = image_size
+        self.extensions = extensions
         
-        # Helper to find images
-        def find_images(directory):
-            extensions = ['*.jpg', '*.png', '*.jpeg', '*.bmp']
-            files = []
-            for ext in extensions:
-                files.extend(glob.glob(os.path.join(directory, ext)))
-                files.extend(glob.glob(os.path.join(directory, ext.upper())))
-            
-            # Recursive if empty
-            if not files:
-                 for ext in extensions:
-                    files.extend(glob.glob(os.path.join(directory, '**', ext), recursive=True))
-                    files.extend(glob.glob(os.path.join(directory, '**', ext.upper()), recursive=True))
-            return sorted(files)
-
-        self.left_images = find_images(self.left_dir)
-        self.right_images = find_images(self.right_dir)
+        # Verify directories exist
+        self.left_dir = self.root_dir / "left"
+        self.right_dir = self.root_dir / "right"
         
-        if len(self.left_images) == 0:
-            print(f"Warning: No images found in {self.left_dir}")
+        if not self.left_dir.exists():
+            raise FileNotFoundError(f"Left directory not found: {self.left_dir}")
+        if not self.right_dir.exists():
+            raise FileNotFoundError(f"Right directory not found: {self.right_dir}")
         
-        # Ensure lengths match or trim
-        min_len = min(len(self.left_images), len(self.right_images))
-        if min_len < len(self.left_images):
-            print(f"Trimming left images from {len(self.left_images)} to {min_len}")
+        # Load image paths
+        self.left_images = self._find_images(self.left_dir)
+        self.right_images = self._find_images(self.right_dir)
+        
+        # Validate image pairs
+        self._validate_image_pairs()
+        
+        # Calculate number of sequences
+        self.num_sequences = len(self.left_images) // self.num_frames
+        if self.num_sequences == 0:
+            raise ValueError(f"Not enough images for {num_frames} frames. Found {len(self.left_images)} images.")
+        
+        logger.info(f"Dataset initialized: {self.num_sequences} sequences from {len(self.left_images)} image pairs")
+    
+    def _find_images(self, directory: Path) -> List[Path]:
+        """Find all images in directory recursively."""
+        images = []
+        for ext in self.extensions:
+            images.extend(directory.glob(f"**/*{ext}"))
+            images.extend(directory.glob(f"**/*{ext.upper()}"))
+        return sorted(images)
+    
+    def _validate_image_pairs(self):
+        """Validate that left and right images match."""
+        if len(self.left_images) != len(self.right_images):
+            logger.warning(f"Mismatched image counts: {len(self.left_images)} left, {len(self.right_images)} right")
+            min_len = min(len(self.left_images), len(self.right_images))
             self.left_images = self.left_images[:min_len]
-        if min_len < len(self.right_images):
-            print(f"Trimming right images from {len(self.right_images)} to {min_len}")
             self.right_images = self.right_images[:min_len]
-            
-        print(f"Found {len(self.left_images)} stereo frames total.")
         
+        # Check that filenames match (optional)
+        for i, (left, right) in enumerate(zip(self.left_images, self.right_images)):
+            if left.name != right.name:
+                logger.warning(f"Filename mismatch at index {i}: {left.name} vs {right.name}")
+    
     def __len__(self):
-        # Return number of full chunks
-        return len(self.left_images) // self.frames
-
-    def __getitem__(self, idx):
-        try:
-            frames_l = []
-            frames_r = []
-
-            # Calculate start position for this chunk
-            start_pos = idx * self.frames
-            
-            for i in range(self.frames):
-                img_path_l = self.left_images[start_pos + i]
-                img_path_r = self.right_images[start_pos + i]
+        return self.num_sequences
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a video sequence.
+        
+        Returns:
+            Dictionary with 'left' and 'right' videos as tensors [T, C, H, W]
+        """
+        # Calculate start index for this sequence
+        start_idx = idx * self.num_frames
+        
+        # Initialize lists
+        left_frames = []
+        right_frames = []
+        
+        # Pre-create resize transform
+        resize_transform = transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.BILINEAR)
+        
+        # Load frames
+        for i in range(self.num_frames):
+            try:
+                # Load images using PIL
+                left_path = self.left_images[start_idx + i]
+                right_path = self.right_images[start_idx + i]
                 
-                # Load images
-                img_l = Image.open(img_path_l).convert('RGB')
-                img_r = Image.open(img_path_r).convert('RGB')
+                # Open and convert images
+                left_img = Image.open(left_path).convert('RGB')
+                right_img = Image.open(right_path).convert('RGB')
                 
                 # Resize
-                img_l = img_l.resize((self.width, self.height), Image.BILINEAR)
-                img_r = img_r.resize((self.width, self.height), Image.BILINEAR)
+                left_img = resize_transform(left_img)
+                right_img = resize_transform(right_img)
                 
-                # Convert to tensor [0, 1] [C, H, W]
-                tensor_l = transforms.functional.to_tensor(img_l)
-                tensor_r = transforms.functional.to_tensor(img_r)
+                # Convert to tensor [C, H, W]
+                left_tensor = transforms.ToTensor()(left_img)
+                right_tensor = transforms.ToTensor()(right_img)
                 
-                frames_l.append(tensor_l)
-                frames_r.append(tensor_r)
-            
-            # Stack [T, C, H, W]
-            video_l = torch.stack(frames_l)
-            video_r = torch.stack(frames_r)
-            
-            # Normalize to [-1, 1]
-            video_l = (video_l * 2.0) - 1.0
-            video_r = (video_r * 2.0) - 1.0
-            
-            return {
-                "left": video_l,
-                "right": video_r
-            }
-        except Exception as e:
-            print(f"Error loading sequence starting at {idx}: {e}")
-            dummy = torch.zeros((self.frames, 3, self.height, self.width))
-            return {"left": dummy, "right": dummy}
+                # Validate tensor shape
+                if left_tensor.shape != (3, self.image_size[1], self.image_size[0]):
+                    raise ValueError(f"Invalid left tensor shape: {left_tensor.shape}")
+                if right_tensor.shape != (3, self.image_size[1], self.image_size[0]):
+                    raise ValueError(f"Invalid right tensor shape: {right_tensor.shape}")
+                
+                # Normalize to [-1, 1]
+                left_tensor = (left_tensor * 2.0) - 1.0
+                right_tensor = (right_tensor * 2.0) - 1.0
+                
+                left_frames.append(left_tensor)
+                right_frames.append(right_tensor)
+                
+            except Exception as e:
+                logger.warning(f"Error loading frame {start_idx + i}: {e}. Using dummy data.")
+                # Create dummy tensors as fallback
+                dummy = torch.zeros(3, self.image_size[1], self.image_size[0])
+                left_frames.append(dummy.clone())
+                right_frames.append(dummy.clone())
+        
+        # Stack frames [T, C, H, W]
+        left_video = torch.stack(left_frames)
+        right_video = torch.stack(right_frames)
+        
+        # Validate final shapes
+        expected_shape = (self.num_frames, 3, self.image_size[1], self.image_size[0])
+        if left_video.shape != expected_shape or right_video.shape != expected_shape:
+            logger.error(f"Shape mismatch: left={left_video.shape}, right={right_video.shape}, expected={expected_shape}")
+        
+        return {
+            "left": left_video,
+            "right": right_video
+        }
 
-# =============================================================================
-# 3. Main Training Logic
-# =============================================================================
 
-def train():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to stereopilot config tensor/toml")
-    parser.add_argument("--train_dir", type=str, default="../mono_train")
-    parser.add_argument("--output_dir", type=str, default="output/checkpoints")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+class Trainer:
+    """
+    Main trainer class for StereoPilot.
+    
+    Handles:
+    - Model initialization and setup
+    - Training loop with mixed precision
+    - Checkpoint saving and logging
+    """
+    
+    def __init__(self, config_path: str, train_dir: str, output_dir: str, 
+                 batch_size: int = 1, learning_rate: float = 3e-4,
+                 num_epochs: int = 10, gradient_accumulation_steps: int = 4,
+                 mixed_precision: str = "bf16"):
+        """
+        Initialize trainer.
+        
+        Args:
+            config_path: Path to model config file (toml)
+            train_dir: Path to training data
+            output_dir: Path to save checkpoints
+            batch_size: Batch size per GPU
+            learning_rate: Learning rate
+            num_epochs: Number of training epochs
+            gradient_accumulation_steps: Gradient accumulation steps
+            mixed_precision: Mixed precision mode ("fp16", "bf16", or None)
+        """
+        self.config_path = config_path
+        self.train_dir = train_dir
+        self.output_dir = Path(output_dir)
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.num_epochs = num_epochs
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.mixed_precision = mixed_precision
+        
+        # Create output directory
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize accelerator
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            mixed_precision=mixed_precision,
+            log_with="tensorboard",
+            project_dir=str(self.output_dir / "logs")
+        )
+        
+        # Set random seed for reproducibility
+        set_seed(42)
+        
+        logger.info("Trainer initialized")
+    
+    def setup_model(self):
+        """Load and configure the model."""
+        logger.info("Loading model configuration...")
+        
+        # Load config
+        with open(self.config_path) as f:
+            config = json.loads(json.dumps(toml.load(f)))
+        
+        # Override dtypes for training
+        if self.accelerator.mixed_precision == "bf16":
+            config['model']['dtype'] = 'bfloat16'
+            config['model']['transformer_dtype'] = 'bfloat16'
+        elif self.accelerator.mixed_precision == "fp16":
+            config['model']['dtype'] = 'float16'
+            config['model']['transformer_dtype'] = 'float16'
+        
+        # Initialize pipeline
+        self.pipeline = StereoPilotPipeline(config)
+        self.pipeline.load_diffusion_model()
+        
+        # Extract components
+        self.transformer = self.pipeline.transformer
+        self.vae = self.pipeline.vae
+        self.text_encoder = self.pipeline.text_encoder
+        
+        # Freeze VAE
+        if hasattr(self.vae, 'model'):
+            self.vae.model.requires_grad_(False)
+            self.vae.model.eval()
+        else:
+            self.vae.requires_grad_(False).eval()
+        logger.info("VAE frozen")
+        
+        # Freeze Text Encoder
+        if hasattr(self.text_encoder, 'model'):
+            self.text_encoder.model.requires_grad_(False)
+            self.text_encoder.model.eval()
+        else:
+            self.text_encoder.requires_grad_(False).eval()
+        logger.info("Text Encoder frozen")
+        
+        # Enable gradient checkpointing for memory efficiency
+        if hasattr(self.transformer, 'enable_gradient_checkpointing'):
+            self.transformer.enable_gradient_checkpointing()
+            logger.info("Gradient checkpointing enabled")
+        
+        # Set transformer to training mode
+        self.transformer.requires_grad_(True)
+        self.transformer.train()
+        logger.info("Transformer set to trainable")
+    
+    def setup_data(self):
+        """Setup data loaders."""
+        logger.info("Setting up data loaders...")
+        
+        # Create dataset
+        dataset = StereoVideoDataset(
+            root_dir=self.train_dir,
+            num_frames=81,
+            image_size=(832, 480)
+        )
+        
+        # Create data loader
+        self.train_loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=min(4, os.cpu_count() or 4),
+            pin_memory=True,
+            drop_last=True
+        )
+        
+        logger.info(f"Created data loader with {len(dataset)} sequences")
+    
+    def setup_optimizer(self):
+        """Setup optimizer and scheduler."""
+        logger.info("Setting up optimizer...")
+        
+        # Filter trainable parameters
+        trainable_params = [p for p in self.transformer.parameters() if p.requires_grad]
+        
+        # Log parameter counts
+        total_params = sum(p.numel() for p in self.transformer.parameters())
+        trainable_param_count = sum(p.numel() for p in trainable_params)
+        
+        logger.info(f"Total parameters: {total_params:,}")
+        logger.info(f"Trainable parameters: {trainable_param_count:,}")
+        logger.info(f"Frozen parameters: {total_params - trainable_param_count:,}")
+        
+        # Create optimizer
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.learning_rate,
+            betas=(0.9, 0.999),
+            weight_decay=1e-2,
+            eps=1e-8
+        )
+        
+        # Create learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=1000,
+            T_mult=2,
+            eta_min=self.learning_rate * 0.1
+        )
+        
+        # Prepare with accelerator
+        self.transformer, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
+            self.transformer, self.optimizer, self.train_loader, self.scheduler
+        )
+    
+    def precompute_text_embeddings(self):
+        """Pre-compute text embeddings for fixed prompt."""
+        logger.info("Pre-computing text embeddings...")
+        
+        # Fixed prompt as per requirements
+        prompt = ["This is a video viewed from the left perspective"]
+        
+        # Move text encoder to device
+        device = self.accelerator.device
+        if hasattr(self.text_encoder, 'model'):
+            self.text_encoder.model.to(device)
+        else:
+            self.text_encoder.to(device)
+        
+        with torch.no_grad():
+            self.context_embeddings = self.text_encoder(prompt, device)
+        
+        logger.info(f"Text embeddings pre-computed: {len(self.context_embeddings)} items")
+    
+    def encode_videos(self, left_video: torch.Tensor, right_video: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode videos to latents using VAE.
+        
+        Memory-efficient implementation that processes videos frame-by-frame
+        to avoid OOM errors with long sequences.
+        
+        Args:
+            left_video: Left view video [B, T, C, H, W]
+            right_video: Right view video [B, T, C, H, W]
+            
+        Returns:
+            left_latents, right_latents: Encoded latents [B, C, T, H_lat, W_lat]
+        """
+        # Permute to [B, C, T, H, W] for VAE
+        left_video = left_video.permute(0, 2, 1, 3, 4)
+        right_video = right_video.permute(0, 2, 1, 3, 4)
+        
+        batch_size = left_video.shape[0]
+        device = self.accelerator.device
+        
+        # Get VAE scale factor
+        scale = getattr(self.vae, 'scale', None)
+        
+        # Process each video in the batch separately to save memory
+        left_latents_list = []
+        right_latents_list = []
+        
+        for b in range(batch_size):
+            left_frames = []
+            right_frames = []
+            
+            # Process each frame separately
+            for t in range(left_video.shape[2]):  # T dimension
+                with torch.no_grad():
+                    # Extract single frame [1, C, 1, H, W]
+                    left_frame = left_video[b:b+1, :, t:t+1, :, :]
+                    right_frame = right_video[b:b+1, :, t:t+1, :, :]
+                    
+                    # Encode frames
+                    left_latent = self.vae.model.encode(left_frame, scale)
+                    right_latent = self.vae.model.encode(right_frame, scale)
+                    
+                    # Handle list outputs
+                    if isinstance(left_latent, list):
+                        left_latent = left_latent[0]
+                    if isinstance(right_latent, list):
+                        right_latent = right_latent[0]
+                    
+                    # Remove batch dimension [C, 1, H_lat, W_lat]
+                    left_frames.append(left_latent.squeeze(0))
+                    right_frames.append(right_latent.squeeze(0))
+            
+            # Concatenate frames along time dimension [C, T, H_lat, W_lat]
+            left_video_latent = torch.cat(left_frames, dim=1)
+            right_video_latent = torch.cat(right_frames, dim=1)
+            
+            left_latents_list.append(left_video_latent)
+            right_latents_list.append(right_video_latent)
+            
+            # Clear cache to free memory
+            if b % 2 == 0:
+                torch.cuda.empty_cache()
+        
+        # Stack batch [B, C, T, H_lat, W_lat]
+        left_latents = torch.stack(left_latents_list)
+        right_latents = torch.stack(right_latents_list)
+        
+        return left_latents, right_latents
+    
+    def compute_loss(self, pred_latents: torch.Tensor, target_latents: torch.Tensor) -> torch.Tensor:
+        """
+        Compute reconstruction loss.
+        
+        Args:
+            pred_latents: Predicted latents
+            target_latents: Target latents
+            
+        Returns:
+            Reconstruction loss
+        """
+        # Simple MSE loss
+        loss = F.mse_loss(pred_latents, target_latents)
+        
+        # Optional: Add perceptual loss components here
+        
+        return loss
+    
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+        """
+        Single training step with memory optimization.
+        
+        Args:
+            batch: Batch dictionary with 'left' and 'right' videos
+            
+        Returns:
+            Loss value
+        """
+        left_video = batch["left"]  # [B, T, C, H, W]
+        right_video = batch["right"]  # [B, T, C, H, W]
+        batch_size = left_video.shape[0]
+        
+        # Clear cache before forward pass
+        torch.cuda.empty_cache()
+        
+        # Encode videos to latents
+        # This is the memory-intensive part, done with no_grad
+        with torch.no_grad():
+            left_latents, right_latents = self.encode_videos(left_video, right_video)
+        
+        # Check for NaNs in latents
+        if torch.isnan(left_latents).any() or torch.isnan(right_latents).any():
+            logger.warning("NaN detected in latents, skipping batch")
+            return torch.tensor(0.0, device=self.accelerator.device)
+        
+        # Fixed timestep (near zero for reconstruction)
+        timestep = torch.full((batch_size,), 0.001, device=self.accelerator.device)
+        
+        # Forward pass through transformer with mixed precision
+        with autocast(enabled=self.mixed_precision is not None):
+            # Input: left latents, target: right latents
+            pred_latents_list = self.transformer(
+                x=left_latents,
+                t=timestep,
+                context=self.context_embeddings,
+                seq_len=81,  # Sequence length
+                domain_label=1  # Converge domain for stereo conversion
+            )
+            
+            # Stack predictions [B, C, T, H_lat, W_lat]
+            pred_latents = torch.stack(pred_latents_list)
+            
+            # Compute reconstruction loss
+            loss = self.compute_loss(pred_latents, right_latents)
+        
+        # Clear intermediate tensors
+        del left_latents, right_latents, pred_latents_list
+        
+        return loss
+    
+    def train(self):
+        """Main training loop with comprehensive logging and monitoring."""
+        logger.info("Starting training...")
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        
+        # Setup
+        self.setup_model()
+        self.setup_data()
+        self.setup_optimizer()
+        self.precompute_text_embeddings()
+        
+        # Move VAE to device
+        device = self.accelerator.device
+        if hasattr(self.vae, 'model'):
+            self.vae.model.to(device)
+        
+        # Initialize training metrics
+        global_step = 0
+        total_loss = 0
+        best_loss = float('inf')
+        steps_per_epoch = len(self.train_loader)
+        
+        logger.info(f"Starting training for {self.num_epochs} epochs ({steps_per_epoch} steps per epoch)")
+        
+        for epoch in range(self.num_epochs):
+            epoch_start = torch.cuda.Event(enable_timing=True)
+            epoch_end = torch.cuda.Event(enable_timing=True)
+            epoch_start.record()
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Epoch {epoch + 1}/{self.num_epochs}")
+            logger.info(f"{'='*60}")
+            
+            epoch_loss = 0
+            num_batches = 0
+            epoch_start_time = torch.cuda.Event(enable_timing=True)
+            epoch_end_time = torch.cuda.Event(enable_timing=True)
+            
+            # Progress bar
+            progress_bar = tqdm(
+                self.train_loader,
+                desc=f"Epoch {epoch + 1}/{self.num_epochs}",
+                disable=not self.accelerator.is_local_main_process,
+                ncols=100
+            )
+            
+            for batch_idx, batch in enumerate(progress_bar):
+                batch_start_time = time.time()
+                
+                # Training step with gradient accumulation
+                with self.accelerator.accumulate(self.transformer):
+                    try:
+                        loss = self.train_step(batch)
+                        
+                        # Skip if loss is zero (failed batch)
+                        if loss.item() == 0.0:
+                            logger.warning(f"Zero loss at batch {batch_idx}, skipping")
+                            continue
+                        
+                        # Backward pass
+                        self.accelerator.backward(loss)
+                        
+                        # Gradient clipping
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.transformer.parameters(),
+                                max_norm=1.0
+                            )
+                        
+                        # Optimizer step
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+                        
+                    except Exception as e:
+                        logger.error(f"Error in training step at batch {batch_idx}: {e}")
+                        continue
+                
+                # Update metrics
+                loss_value = loss.item()
+                epoch_loss += loss_value
+                total_loss += loss_value
+                num_batches += 1
+                global_step += 1
+                
+                # Calculate batch time
+                batch_time = time.time() - batch_start_time
+                
+                # Update progress bar
+                if batch_idx % 10 == 0:
+                    progress_bar.set_postfix({
+                        "loss": f"{loss_value:.4f}",
+                        "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                        "time": f"{batch_time:.2f}s"
+                    })
+                
+                # Memory usage logging
+                if global_step % 100 == 0 and torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    reserved = torch.cuda.memory_reserved() / 1024**3
+                    logger.info(f"Step {global_step} - GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                
+                # Log to tensorboard
+                if self.accelerator.is_main_process and global_step % 50 == 0:
+                    self.accelerator.log({
+                        "train/loss": loss_value,
+                        "train/lr": self.scheduler.get_last_lr()[0],
+                        "train/epoch": epoch,
+                        "train/grad_norm": grad_norm.item() if 'grad_norm' in locals() else 0,
+                    }, step=global_step)
+            
+            # Epoch summary
+            epoch_end.record()
+            torch.cuda.synchronize()
+            epoch_time = epoch_start.elapsed_time(epoch_end) / 1000  # Convert to seconds
+            
+            avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+            
+            logger.info(f"\nEpoch {epoch + 1} Summary:")
+            logger.info(f"  Average Loss: {avg_epoch_loss:.4f}")
+            logger.info(f"  Time: {epoch_time:.2f} seconds")
+            logger.info(f"  Steps: {num_batches}")
+            
+            # Save checkpoint
+            if self.accelerator.is_main_process:
+                is_best = avg_epoch_loss < best_loss
+                if is_best:
+                    best_loss = avg_epoch_loss
+                
+                self.save_checkpoint(epoch, avg_epoch_loss, global_step, is_best)
+                
+                # Log epoch metrics
+                self.accelerator.log({
+                    "epoch/avg_loss": avg_epoch_loss,
+                    "epoch/time": epoch_time,
+                    "epoch/best_loss": best_loss
+                }, step=epoch)
+        
+        # Training completed
+        total_training_time = epoch_start.elapsed_time(epoch_end) / 1000
+        logger.info(f"\n{'='*60}")
+        logger.info("Training completed!")
+        logger.info(f"{'='*60}")
+        
+        avg_total_loss = total_loss / global_step if global_step > 0 else 0
+        logger.info(f"Final Metrics:")
+        logger.info(f"  Average Loss: {avg_total_loss:.4f}")
+        logger.info(f"  Best Loss: {best_loss:.4f}")
+        logger.info(f"  Total Steps: {global_step}")
+        logger.info(f"  Total Time: {total_training_time:.2f} seconds")
+    
+    def save_checkpoint(self, epoch: int, loss: float, global_step: int, is_best: bool = False):
+        """Save model checkpoint."""
+        # Unwrap model
+        unwrapped_model = self.accelerator.unwrap_model(self.transformer)
+        
+        # Prepare checkpoint data
+        checkpoint_data = {
+            'epoch': epoch + 1,
+            'global_step': global_step,
+            'model_state_dict': unwrapped_model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'loss': loss,
+        }
+        
+        # Save regular checkpoint
+        checkpoint_path = self.output_dir / f"checkpoint_epoch_{epoch + 1:03d}.pt"
+        torch.save(checkpoint_data, checkpoint_path)
+        logger.info(f"Checkpoint saved: {checkpoint_path}")
+        
+        # Save weights in safetensors format
+        weights_path = self.output_dir / f"stereopilot_epoch_{epoch + 1:03d}.safetensors"
+        from safetensors.torch import save_file
+        save_file(unwrapped_model.state_dict(), weights_path)
+        logger.info(f"Weights saved: {weights_path}")
+        
+        # Save best model
+        if is_best:
+            best_checkpoint_path = self.output_dir / "best_checkpoint.pt"
+            best_weights_path = self.output_dir / "best_model.safetensors"
+            
+            torch.save(checkpoint_data, best_checkpoint_path)
+            save_file(unwrapped_model.state_dict(), best_weights_path)
+            
+            logger.info(f"Best model saved (loss: {loss:.4f})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train StereoPilot model")
+    parser.add_argument("--config", type=str, default="toml/infer.toml",
+                        help="Path to model config file")
+    parser.add_argument("--train_dir", type=str, default="../SP_Data/mono_train",
+                        help="Path to training data")
+    parser.add_argument("--output_dir", type=str, default="../SP_Data/checkpoints",
+                        help="Path to save checkpoints")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size per GPU")
+    parser.add_argument("--learning_rate", type=float, default=3e-4,
+                        help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=10,
+                        help="Number of training epochs")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
+                        help="Gradient accumulation steps")
+    parser.add_argument("--mixed_precision", type=str, default="bf16",
+                        choices=["fp16", "bf16", "no"],
+                        help="Mixed precision mode")
+    
     args = parser.parse_args()
     
-    # Check for CUDA availability and support
-    use_cpu = False
-    if torch.cuda.is_available():
-        try:
-            # Check for RTX 5090 which is incompatible with current PyTorch binary
-            if "5090" in torch.cuda.get_device_name(0):
-                 print(f"Detected {torch.cuda.get_device_name(0)}. Current PyTorch version has no kernels for this GPU. Falling back to CPU to enable training.")
-                 use_cpu = True
-            else:
-                 t = torch.zeros(1).cuda()
-                 torch.cuda.synchronize()
-        except RuntimeError as e:
-            use_cpu = True
-            print(f"CUDA available but failed to run: {e}. Falling back to CPU.")
+    # Create trainer
+    trainer = Trainer(
+        config_path=args.config,
+        train_dir=args.train_dir,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        num_epochs=args.epochs,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision if args.mixed_precision != "no" else None
+    )
     
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, cpu=use_cpu)
-    set_seed(42)
-    
-    if accelerator.is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
-        print(f"Training with config: {args.config}")
+    # Start training
+    trainer.train()
 
-    # Load Config
-    with open(args.config) as f:
-        config = json.loads(json.dumps(toml.load(f)))
-        
-    if use_cpu:
-         print("Overriding config dtypes to float32/bfloat16 for CPU execution")
-         if 'model' in config:
-              # Prefer bfloat16 if likely supported, else float32. 
-              # Using bfloat16 matches typical training precision.
-              config['model']['dtype'] = 'bfloat16' 
-              config['model']['transformer_dtype'] = 'bfloat16'
-    else:
-        # GPU execution: Avoid float8 for training as standard nn.Linear fails with bfloat16 inputs
-         if 'model' in config:
-              if config['model'].get('transformer_dtype') == 'float8':
-                   print("Switching transformer_dtype from 'float8' to 'bfloat16' for training compatibility.")
-                   config['model']['transformer_dtype'] = 'bfloat16'
 
-    
-    # Initialize Pipeline
-    # This loads VAE and initializes models
-    pipeline = StereoPilotPipeline(config)
-    pipeline.load_diffusion_model()
-    
-    # 获取各个模型组件
-    model = pipeline.transformer
-    vae = pipeline.vae
-    text_encoder = pipeline.text_encoder
-    
-    # =========================================================
-    # 冻结策略 (Freeze Strategy)
-    # =========================================================
-    
-    # 1. 冻结 VAE
-    # WanVAE内部通常有一个.model属性 (encoder/decoder)，我们需要冻结它
-    if hasattr(vae, 'model'):
-        vae.model.requires_grad_(False)
-        vae.model.eval()
-    else:
-        vae.requires_grad_(False).eval()
-    print("VAE frozen.")
-        
-    # 2. 冻结 Text Encoder (UMT5/T5)
-    # T5EncoderModel封装了.model (T5Encoder)
-    if hasattr(text_encoder, 'model'):
-        text_encoder.model.requires_grad_(False)
-        text_encoder.model.eval()
-    else:
-        text_encoder.requires_grad_(False).eval()
-    print("Text Encoder frozen.")
-        
-    # 3. 配置 Transformer (Fine-tune)
-    # 微调 Transformer Decoder (包含原层 + 新增的 domain embedding)
-    # 启用梯度
-    model.requires_grad_(True)
-    model.train()
-    print("Transformer set to trainable.")
-    
-    # 检查新增参数 (domain embeddings) 是否存在并可训练
-    if hasattr(model, 'parall_embedding'):
-        print("Confirmed: parall_embedding exists in model.")
-    if hasattr(model, 'converge_embedding'):
-        print("Confirmed: converge_embedding exists in model.")
+"""
+## Detailed Usage Instructions
 
-    # =========================================================
-    # 自定义 Forward (Inject Embeddings)
-    # =========================================================
-    # 这里从StereoPilot代码中复制custom_forward逻辑，
-    # 主要是为了注入domain_embedding (parall/converge) 和处理 context
-    def new_custom_forward(self, x, t, context, seq_len, clip_fea=None, y=None, domain_label=0):
-        device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-             self.freqs = self.freqs.to(device)
+### 1. Training Data Preparation
 
-        if y is not None:
-             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+The training data should be organized as follows:
 
-        # Ensure correct dtype
-        x = [u.to(self.patch_embedding.weight.dtype) for u in x]
+```
+../SP_Data/mono_train/
+├── left/
+│   ├── frame_00001.jpg
+│   ├── frame_00002.jpg
+│   └── ...
+└── right/
+    ├── frame_00001.jpg
+    ├── frame_00002.jpg
+    └── ...
+```
 
-        # Patch Embedding
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        input_seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        
-        # Concat batch
-        x = torch.cat(x, dim=0) # [B, L, C]
-        
-        # Time embedding
-        # Cast input to match the model weights (e.g. bfloat16), avoiding float32 force-cast which causes mismatch on CPU
-        t_emb = sinusoidal_embedding_1d(self.freq_dim, t).to(self.patch_embedding.weight.dtype)
-        e = self.time_embedding(t_emb)
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-        
-        # Domain embedding (StereoPilot特有逻辑)
-        # domain_label=0 -> parall (平行), domain_label=1 -> converge (汇聚/交叉)
-        if domain_label == 0:
-             domain_emb = self.parall_embedding.unsqueeze(0)
-        else:
-             domain_emb = self.converge_embedding.unsqueeze(0)
-        e0 = e0 + domain_emb.to(e0.dtype)
-        
-        # Process Context (Text Embeddings)
-        # Context在这里传入的是list of tensors (from T5Encoder)
-        if isinstance(context, list):
-             # 确保 context 长度一致或正确 padding (WanModel 的 text_embedding 需要 stack 后的 tensor)
-             # WanModel 内部 text_embedding 可能期待 [B, L, C] 或 [sum(L), C]
-             # 原StereoPilot逻辑:
-            context = self.text_embedding(
-                torch.stack([
-                    torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                    for u in context
-                ])
-            )
-        else:
-            # 如果已经是tensor
-            pass 
-            
-        kwargs = dict(
-             e=e0,
-             seq_lens=input_seq_lens,
-             grid_sizes=grid_sizes,
-             freqs=self.freqs,
-             context=context,
-             context_lens=None
-        )
+Requirements:
+- Left and right images must be paired (same filename)
+- Images will be resized to 832x480
+- At least 81 images per training sequence
+- Supported formats: JPG, JPEG, PNG, BMP
 
-        for block in self.blocks:
-             x = block(x, **kwargs)
+### 2. Model Configuration
 
-        x = self.head(x, e)
-        x = self.unpatchify(x, grid_sizes)
-        
-        # 返回Latent (list of floats/tensors)
-        return [u.float() for u in x]
+The config file (toml/infer.toml) should contain:
 
-    # Bind new forward method to the model instance
-    model.forward = types.MethodType(new_custom_forward, model)
-    
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
-    # Dataloader
-    dataset = StereoVideoDataset(args.train_dir, width=832, height=480, frames=81)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
-    
-    # Prepare with Accelerator
-    # IMPORTANT: Prepare wraps the model.
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    
-    # Move frozen components to correct device (since they were loaded on CPU via patch)
-    print(f"Moving frozen components to {accelerator.device}...")
-    
-    # 1. Move VAE
-    if hasattr(vae, 'model'):
-        vae.model.to(accelerator.device)
-    elif isinstance(vae, torch.nn.Module):
-        vae.to(accelerator.device)
-        
-    # Also move VAE scale/mean/std if they exist (they might be tensors or lists of tensors)
-    for attr_name in ['scale', 'mean', 'std']:
-        if hasattr(vae, attr_name):
-            val = getattr(vae, attr_name)
-            if isinstance(val, torch.Tensor):
-                setattr(vae, attr_name, val.to(accelerator.device))
-            elif isinstance(val, list):
-                # Check if list contains tensors (e.g. scale is [tensor(shift), tensor(scale)])
-                if len(val) > 0 and isinstance(val[0], torch.Tensor):
-                    new_val = [v.to(accelerator.device) for v in val]
-                    setattr(vae, attr_name, new_val)
+```toml
+[model]
+type = 'stereopilot'
+ckpt_path = '../SP_Data/ckpt/Wan2.1-T2V-1.3B'  # Base Wan2.1 model
+transformer_path = '../SP_Data/ckpt/StereoPilot.safetensors'  # Pretrained weights
+pretrained_path = '../SP_Data/ckpt/StereoPilot.safetensors'  # Domain embeddings
+dtype = 'bfloat16'
+transformer_dtype = 'bfloat16'
+```
 
-    # 2. Move Text Encoder    
-    if hasattr(text_encoder, 'model'):
-        text_encoder.model.to(accelerator.device)
-    elif isinstance(text_encoder, torch.nn.Module):
-        text_encoder.to(accelerator.device)
+### 3. Training Command
 
-    # Constants
-    # t0=0.001 代表极小的噪声水平/接近Clean数据。
-    # 这意味着我们是在训练一个 "Late-Stage Refinement" 或 "Restoration" 任务，
-    # 即 Learning to map Left(Clean) -> Right(Clean) directly via the transformer structure.
-    t0 = torch.tensor([0.001], device=accelerator.device) 
-    
-    empty_prompt = ["This is a left-eye perspective video."] * args.batch_size
-    
-    # Pre-compute text embeddings to save optimization time
-    print("Pre-computing text embeddings...")
-    with torch.no_grad():
-        empty_context_list = text_encoder(empty_prompt, accelerator.device) # Returns list of tensors
-    
-    global_step = 0
-    print("Starting Training Loop...")
-    
-    for epoch in range(args.epochs):
-        for batch in dataloader:
-            with accelerator.accumulate(model):
-                left_vid = batch['left'].permute(0, 2, 1, 3, 4).to(accelerator.device) # [B, C, T, H, W]
-                right_vid = batch['right'].permute(0, 2, 1, 3, 4).to(accelerator.device)
-                
-                # Check NaNs
-                if torch.isnan(left_vid).any() or torch.isnan(right_vid).any():
-                    print("NaN in input video, skipping")
-                    continue
-                
-                # Encode Latents (VAE)
-                with torch.no_grad():
-                    # VAE Encode
-                    # Use internal model.encode to match StereoPilot.py logic (with scale)
-                    # Input to encode: [B, C, T, H, W]
-                    z_left_list = []
-                    z_right_list = []
-                    
-                    batch_size_actual = left_vid.shape[0]
-                    for i in range(batch_size_actual):
-                        l_in = left_vid[i].unsqueeze(0) # [1, C, T, H, W]
-                        r_in = right_vid[i].unsqueeze(0)
-                        
-                        # Use model.encode with scale
-                        # Returns Latents usually? Or distribution? StereoPilot.py implies direct use.
-                        z_l = vae.model.encode(l_in, vae.scale)
-                        z_r = vae.model.encode(r_in, vae.scale)
-                        
-                        if isinstance(z_l, list): # Handle if it returns list
-                            z_l = z_l[0]
-                        if isinstance(z_r, list):
-                            z_r = z_r[0]
-                            
-                        z_left_list.append(z_l.squeeze(0))
-                        z_right_list.append(z_r.squeeze(0))
-                    
-                    z_left = torch.stack(z_left_list) # [B, C, T, H_lat, W_lat]
-                    z_right = torch.stack(z_right_list)
-                
-                # Forward Pass
-                # Task: Left View -> Right View Reconstruction
-                # t is fixed to nearly 0
-                t = t0.repeat(args.batch_size)
-                
-                # x=z_left (Condition/Input), context=Text, domain_label=1 (Convergent/3D Movie)
-                pred_right_list = model(
-                    x=z_left,
-                    t=t,
-                    context=empty_context_list, # Reuse pre-computed
-                    seq_len=81, # Should match latent seq len logic roughly? Or Max len? 
-                    domain_label=1 
-                )
-                pred_right = torch.stack(pred_right_list)
-                
-                # Loss
-                recon_loss = F.mse_loss(pred_right, z_right)
-                
-                loss = recon_loss
-                
-                accelerator.backward(loss)
-                optimizer.step()
-                optimizer.zero_grad()
-                
-            if global_step % 10 == 0 and accelerator.is_main_process:
-                print(f"Epoch {epoch} Step {global_step} | Loss: {loss.item():.4f} (R: {recon_loss.item():.4f})")
-                
-            global_step += 1
-            
-        # Checkpointing
-        if accelerator.is_main_process:
-            save_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pt")
-            # 使用 unwrap_model 获取原始模型进行保存，避免DDP wrap wrapper问题
-            unwrapped_model = accelerator.unwrap_model(model)
-            accelerator.save(unwrapped_model.state_dict(), save_path)
-            print(f"Saved checkpoint to {save_path}")
+Basic training:
+```bash
+python train.py \
+    --config toml/infer.toml \
+    --train_dir ../SP_Data/mono_train \
+    --output_dir ../SP_Data/checkpoints \
+    --batch_size 1 \
+    --learning_rate 3e-4 \
+    --epochs 10 \
+    --gradient_accumulation_steps 4 \
+    --mixed_precision bf16
+```
+
+### 4. Memory Optimization Options
+
+For different GPU memory sizes:
+
+**RTX 3090/4090 (24GB):**
+```bash
+--batch_size 1 --gradient_accumulation_steps 8 --mixed_precision bf16
+```
+
+**A100/A800 (40-80GB):**
+```bash
+--batch_size 2 --gradient_accumulation_steps 4 --mixed_precision bf16
+```
+
+**RTX 5090 (32GB):**
+```bash
+--batch_size 1 --gradient_accumulation_steps 6 --mixed_precision bf16
+```
+
+### 5. Training Process
+
+The training process:
+
+1. **Data Loading**: Loads 81-frame sequences from left/right directories
+2. **Encoding**: VAE encodes videos to latent space (frame-by-frame for memory efficiency)
+3. **Forward Pass**: Transformer processes left latents to predict right latents
+4. **Loss Calculation**: MSE loss between predicted and actual right latents
+5. **Backward Pass**: Gradient accumulation and mixed precision training
+6. **Optimization**: AdamW with cosine annealing scheduler
+
+### 6. Key Features
+
+**Memory Optimization:**
+- Gradient checkpointing enabled
+- Frame-by-frame VAE encoding
+- Mixed precision training (bfloat16)
+- Gradient accumulation
+- Automatic memory cleanup
+
+**Training Stability:**
+- Fixed timestep (t=0.001) for reconstruction
+- Frozen VAE and text encoder
+- Only transformer and domain embeddings trained
+- Gradient clipping (max_norm=1.0)
+- NaN detection and batch skipping
+
+**Monitoring:**
+- Tensorboard logging
+- Progress bars with live metrics
+- GPU memory usage tracking
+- Checkpoint saving (regular and best models)
+
+### 7. Outputs
+
+Training produces:
+
+1. **Checkpoints**: Full training state
+   - `checkpoint_epoch_XXX.pt`: Full checkpoint with optimizer state
+   - `stereopilot_epoch_XXX.safetensors`: Model weights only
+
+2. **Best Model**: Best performing checkpoint
+   - `best_checkpoint.pt`: Best full checkpoint
+   - `best_model.safetensors`: Best model weights
+
+3. **Logs**: Training metrics
+   - `training.log`: Text log file
+   - Tensorboard logs in `logs/` directory
+
+### 8. Model Architecture Details
+
+**Components:**
+- VAE Encoder: Encodes 81 frames to latent space
+- Text Encoder: UMT5 (frozen, pre-computed embeddings)
+- Transformer: Wan2.1 backbone + domain embeddings
+- Domain Embeddings: parall_embedding and converge_embedding
+
+**Training Objective:**
+- Reconstruct right view from left view
+- Fixed timestep for late-stage refinement
+- MSE loss in latent space
+
+### 9. Troubleshooting
+
+**Out of Memory:**
+- Reduce batch_size to 1
+- Increase gradient_accumulation_steps
+- Use mixed_precision bf16
+- Close other GPU applications
+
+**Slow Training:**
+- Reduce num_workers in DataLoader (if CPU bottleneck)
+- Ensure GPU utilization with nvidia-smi
+- Check disk I/O speed for data loading
+
+**NaN Loss:**
+- Check input data for corruption
+- Reduce learning rate
+- Ensure VAE and text encoder are frozen
+
+**Poor Convergence:**
+- Verify data quality and alignment
+- Check that timestep is fixed to 0.001
+- Ensure domain_label=1 for stereo conversion
+- Increase training epochs
+
+### 10. Advanced Usage
+
+**Resume Training:**
+Modify the trainer to load from checkpoint:
+```python
+checkpoint = torch.load("checkpoint_epoch_XXX.pt")
+self.transformer.load_state_dict(checkpoint['model_state_dict'])
+self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+```
+
+**Custom Loss:**
+Modify the `compute_loss` method to add:
+- Perceptual loss
+- Adversarial loss
+- Stereo consistency loss
+
+**Multi-GPU Training:**
+Accelerate automatically handles multi-GPU training.
+Just run the script on a machine with multiple GPUs.
+
+**Inference:**
+Use the trained model with the original `sample.py` script:
+```bash
+python sample.py \
+    --config toml/infer.toml \
+    --input /path/to/left_video.mp4 \
+    --output_folder /path/to/output \
+    --device cuda:0
+```
+
+For more details, see the StereoPilot paper and original repository.
+"""
 
 if __name__ == "__main__":
-    train()
+    main()
