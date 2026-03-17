@@ -20,6 +20,7 @@ import argparse
 import json
 import time
 import gc
+import toml
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
@@ -54,6 +55,98 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
 
 from models.StereoPilot import StereoPilotPipeline
+from utils.common import DTYPE_MAP
+
+# Import amp from the correct location for compatibility
+try:
+    from torch import amp
+except ImportError:
+    from torch.cuda import amp
+
+
+def bind_custom_forward(model):
+    """
+    Bind custom forward method to model that accepts domain_label parameter.
+    
+    This is needed because the original WanModel.forward() does not accept domain_label,
+    but StereoPilot requires it for domain adaptation.
+    """
+    from models.wan import sinusoidal_embedding_1d
+    
+    # Use closure to capture model - this avoids the MethodType binding issue
+    # where 'self' would be passed as first argument
+    def custom_forward(x, t, context, seq_len, clip_fea=None, y=None, domain_label=0):
+        """
+        Forward pass through diffusion model with domain label support.
+        
+        Args:
+            x: Input video tensor list
+            t: Diffusion timestep
+            context: Text embedding list
+            seq_len: Max sequence length
+            clip_fea: CLIP image features (optional)
+            y: Conditional video input (optional)
+            domain_label: Domain label (0=stereo4d, 1=3dmovie)
+        """
+        device = model.patch_embedding.weight.device
+        if model.freqs.device != device:
+            model.freqs = model.freqs.to(device)
+
+        if y is not None:
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        x = [model.patch_embedding(u.unsqueeze(0)) for u in x]
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        assert seq_lens.max() <= seq_len
+        x = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x
+        ])
+    
+        # Time embedding
+        with amp.autocast(device_type='cuda', dtype=torch.float32):
+            e = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, t).float())
+            e0 = model.time_projection(e).unflatten(1, (6, model.dim))
+        
+        # Domain embedding
+        if domain_label == 0:
+            domain_emb = model.parall_embedding.unsqueeze(0)
+        else:
+            domain_emb = model.converge_embedding.unsqueeze(0)
+        e0 = e0 + domain_emb.to(e0.dtype)
+        
+        # Text context
+        context = model.text_embedding(
+            torch.stack([
+                torch.cat([u, u.new_zeros(model.text_len - u.size(0), u.size(1))])
+                for u in context
+            ])
+        )
+
+        if clip_fea is not None:
+            context_clip = model.img_emb(clip_fea)
+            context = torch.concat([context_clip, context], dim=1)
+
+        kwargs = dict(
+            e=e0,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=model.freqs,
+            context=context,
+            context_lens=None
+        )
+
+        for block in model.blocks:
+            x = block(x, **kwargs)
+
+        x = model.head(x, e)
+        x = model.unpatchify(x, grid_sizes)
+        return [u.float() for u in x]
+    
+    # Directly assign the closure function (not MethodType)
+    # The closure captures 'model' internally, so no self binding needed
+    model.forward = custom_forward
 
 
 @dataclass
@@ -192,8 +285,11 @@ class StereoVideoDataset(Dataset):
             start_idx = len(self.left_images) - self.num_frames
         
         # Pre-create resize transform
+        # transforms.Resize expects (height, width), but self.image_size is (width, height)
+        # So we need to swap: Resize((H, W)) where H=image_size[1], W=image_size[0]
+        target_h, target_w = self.image_size[1], self.image_size[0]  # (480, 832)
         resize_transform = transforms.Resize(
-            self.image_size, 
+            (target_h, target_w),  # (height, width)
             interpolation=transforms.InterpolationMode.BILINEAR,
             antialias=True
         )
@@ -212,21 +308,13 @@ class StereoVideoDataset(Dataset):
                 left_img = Image.open(left_path).convert('RGB')
                 right_img = Image.open(right_path).convert('RGB')
                 
-                # Resize
+                # Resize to target size
                 left_img = resize_transform(left_img)
                 right_img = resize_transform(right_img)
                 
                 # Convert to tensor [C, H, W]
                 left_tensor = transforms.ToTensor()(left_img)
                 right_tensor = transforms.ToTensor()(right_img)
-                
-                # Validate tensor shape
-                expected_shape = (3, self.image_size[1], self.image_size[0])
-                if left_tensor.shape != expected_shape or right_tensor.shape != expected_shape:
-                    raise ValueError(
-                        f"Invalid tensor shape. Expected {expected_shape}, "
-                        f"got left={left_tensor.shape}, right={right_tensor.shape}"
-                    )
                 
                 # Normalize to [-1, 1]
                 left_tensor = (left_tensor * 2.0) - 1.0
@@ -242,7 +330,7 @@ class StereoVideoDataset(Dataset):
                     f"Path: {left_path if 'left_path' in locals() else 'unknown'}"
                 )
                 # Create dummy tensors as fallback
-                dummy = torch.zeros(3, self.image_size[1], self.image_size[0])
+                dummy = torch.zeros(3, target_h, target_w)
                 left_frames.append(dummy.clone())
                 right_frames.append(dummy.clone())
         
@@ -290,10 +378,18 @@ class Trainer:
             logging_dir=str(self.output_dir / "logs")
         )
         
+        # Try to use tensorboard, fall back to None if not available
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            log_with = "tensorboard"
+        except ImportError:
+            log_with = None
+            logger.warning("Tensorboard not available. Install with: pip install tensorboard")
+        
         self.accelerator = Accelerator(
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             mixed_precision=config.mixed_precision,
-            log_with="tensorboard",
+            log_with=log_with,
             project_config=project_config
         )
         
@@ -327,12 +423,18 @@ class Trainer:
             model_config = json.loads(json.dumps(toml.load(f)))
         
         # Override dtypes for training based on mixed precision setting
+        # Note: Keep as string here, will be converted to torch.dtype via DTYPE_MAP
         if self.accelerator.mixed_precision == "bf16":
             model_config['model']['dtype'] = 'bfloat16'
             model_config['model']['transformer_dtype'] = 'bfloat16'
         elif self.accelerator.mixed_precision == "fp16":
             model_config['model']['dtype'] = 'float16'
             model_config['model']['transformer_dtype'] = 'float16'
+        
+        # Convert dtype strings to torch.dtype using DTYPE_MAP (like evaluate.py does)
+        model_config['model']['dtype'] = DTYPE_MAP[model_config['model']['dtype']]
+        if 'transformer_dtype' in model_config['model']:
+            model_config['model']['transformer_dtype'] = DTYPE_MAP[model_config['model']['transformer_dtype']]
         
         # Initialize pipeline
         self.pipeline = StereoPilotPipeline(model_config)
@@ -342,6 +444,12 @@ class Trainer:
         self.transformer = self.pipeline.transformer
         self.vae = self.pipeline.vae
         self.text_encoder = self.pipeline.text_encoder
+        
+        # Bind custom forward method that accepts domain_label parameter
+        # This is essential for StereoPilot domain adaptation
+        bind_custom_forward(self.transformer)
+        if self.accelerator.is_main_process:
+            logger.info("✓ Custom forward method bound to transformer (supports domain_label)")
         
         # Freeze VAE (both encoder and decoder)
         if hasattr(self.vae, 'model'):
@@ -397,13 +505,23 @@ class Trainer:
             return
         
         def count_params(model, name):
-            total = sum(p.numel() for p in model.parameters())
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            frozen = total - trainable
-            logger.info(
-                f"  {name}: {total:,} total, {trainable:,} trainable, {frozen:,} frozen"
-            )
-            return total, trainable
+            # Handle wrapped models (VAE, TextEncoder have .model attribute)
+            if hasattr(model, 'model') and hasattr(model.model, 'parameters'):
+                actual_model = model.model
+            else:
+                actual_model = model
+            
+            try:
+                total = sum(p.numel() for p in actual_model.parameters())
+                trainable = sum(p.numel() for p in actual_model.parameters() if p.requires_grad)
+                frozen = total - trainable
+                logger.info(
+                    f"  {name}: {total:,} total, {trainable:,} trainable, {frozen:,} frozen"
+                )
+                return total, trainable
+            except Exception as e:
+                logger.warning(f"  {name}: Could not count parameters - {e}")
+                return 0, 0
         
         logger.info("Parameter counts:")
         total_params = 0
@@ -421,10 +539,11 @@ class Trainer:
         total_params += t
         total_trainable += tr
         
-        logger.info(
-            f"  Total: {total_params:,} parameters, "
-            f"{total_trainable:,} trainable ({100*total_trainable/total_params:.1f}%)"
-        )
+        if total_params > 0:
+            logger.info(
+                f"  Total: {total_params:,} parameters, "
+                f"{total_trainable:,} trainable ({100*total_trainable/total_params:.1f}%)"
+            )
     
     def setup_data(self):
         """Setup data loaders with optimized settings."""
@@ -678,15 +797,34 @@ class Trainer:
         # Fixed timestep (near zero for reconstruction)
         timestep = torch.full((batch_size,), 0.001, device=self.accelerator.device)
         
+        # Convert latents to list format expected by custom_forward
+        # custom_forward expects x as a list of tensors, each with shape (C, T, H, W)
+        # left_latents shape: [B, C, T, H, W] -> split into list of (C, T, H, W) tensors
+        left_latents_list = [left_latents[b] for b in range(batch_size)]
+        
+        # Calculate seq_len based on latent shape
+        # Formula from Wan2.1: seq_len = ceil((H * W) / (patch_h * patch_w) * T / sp_size) * sp_size
+        # latent shape: (C, T, H, W)
+        latent_shape = left_latents_list[0].shape  # (C, T, H, W)
+        patch_size = self.pipeline.patch_size  # (t_patch, h_patch, w_patch)
+        sp_size = getattr(self.pipeline, 'sp_size', 1)
+        
+        # Calculate sequence length in latent space
+        import math
+        seq_len = math.ceil(
+            (latent_shape[2] * latent_shape[3]) / (patch_size[1] * patch_size[2]) *
+            latent_shape[1] / sp_size
+        ) * sp_size
+        
         # Forward pass through transformer with mixed precision
         with autocast(enabled=self.config.mixed_precision is not None):
             # Input: left latents, target: right latents
             try:
                 pred_latents_list = self.transformer(
-                    x=left_latents,
+                    x=left_latents_list,  # List of (C, T, H, W) tensors
                     t=timestep,
                     context=self.context_embeddings,
-                    seq_len=self.config.num_frames,  # Sequence length
+                    seq_len=seq_len,  # Dynamically calculated sequence length
                     domain_label=1  # Converge domain for stereo conversion
                 )
                 
@@ -697,7 +835,9 @@ class Trainer:
                 loss = self.compute_loss(pred_latents, right_latents)
                 
             except Exception as e:
+                import traceback
                 logger.error(f"Error in transformer forward pass: {e}")
+                logger.error(traceback.format_exc())
                 return 0.0, {"loss": 0.0, "mse_loss": 0.0}
         
         # Clear intermediate tensors
