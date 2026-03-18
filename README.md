@@ -1,23 +1,35 @@
 ## 📑 目录
 
-- [Requirements](#️-requirements)
-- [Installation](#️-installation)
-- [LoRA Training](#️-lora-training)
+- [📑 目录](#-目录)
+- [⚙️ Requirements](#️-requirements)
+- [🛠️ Installation](#️-installation)
+- [🏋️ LoRA Training](#️-lora-training)
   - [Why LoRA?](#why-lora)
   - [Running Training](#running-training)
   - [Training Parameters](#training-parameters)
+    - [Basic Training Parameters](#basic-training-parameters)
+    - [Memory Optimization Parameters](#memory-optimization-parameters)
+    - [LoRA-Specific Parameters](#lora-specific-parameters)
+    - [Checkpoint Parameters](#checkpoint-parameters)
   - [Training Data Format](#training-data-format)
   - [Output Directory Structure](#output-directory-structure)
   - [Training Framework Architecture](#training-framework-architecture)
+  - [Training Pipeline](#training-pipeline)
   - [Memory Optimization Tips](#memory-optimization-tips)
-- [LoRA Inference Testing](#-lora-inference-testing)
+- [🔍 Base Model Evaluation](#-base-model-evaluation)
+  - [Running Evaluation](#running-evaluation)
+  - [Evaluation Parameters](#evaluation-parameters)
+  - [Evaluation Output Structure](#evaluation-output-structure)
+- [🧪 LoRA Inference Testing](#-lora-inference-testing)
   - [Running Inference Tests](#running-inference-tests)
   - [Inference Test Parameters](#inference-test-parameters)
   - [Test Output Structure](#test-output-structure)
   - [Understanding Test Results](#understanding-test-results)
-- [FAQ](#-faq)
-- [License](#-license)
-- [Acknowledgments](#-acknowledgments)
+- [❓ FAQ](#-faq)
+  - [推理时的文本提示词在哪里修改？](#推理时的文本提示词在哪里修改)
+  - [推理时的输入帧数是多少？](#推理时的输入帧数是多少)
+- [📄 License](#-license)
+- [🙏 Acknowledgments](#-acknowledgments)
 
 ---
 
@@ -284,6 +296,56 @@ lora_manager.load_lora_weights("path/to/lora_weights_epoch_010.safetensors")
 - Use `--mixed_precision bf16` for RTX 30xx/40xx/50xx GPUs
 - Reduce `--num_frames` if OOM during VAE encoding
 - Increase `--gradient_accumulation_steps` to maintain effective batch size
+
+---
+
+## 🔍 Base Model Evaluation
+
+Before training LoRA, you can evaluate the base StereoPilot model's performance on the test dataset using `evaluate.py`. This helps establish a baseline for comparison.
+
+### Running Evaluation
+
+**Default evaluation (uses mono2stereo-test dataset):**
+
+```bash
+python evaluate.py
+```
+
+**Custom paths:**
+
+```bash
+python evaluate.py \
+    --data_root ../SP_Data/mono2stereo-test \
+    --output_folder ../SP_Data/evaluate_output \
+    --device cuda:0
+```
+
+### Evaluation Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--config` | `toml/infer.toml` | Path to model config file (TOML format) |
+| `--data_root` | `../SP_Data/mono2stereo-test` | Path to test dataset directory |
+| `--output_folder` | `../SP_Data/evaluate_output` | Path to save evaluation results |
+| `--device` | `cuda:0` | Device to use for inference |
+
+### Evaluation Output Structure
+
+After running evaluation, the output directory will contain:
+
+```
+../SP_Data/evaluate_output/
+├── evaluation_results.txt      # Human-readable results log
+├── metrics_summary.json        # Detailed metrics in JSON format
+├── animation/                  # Output images for animation subset
+│   ├── img001.png
+│   ├── img002.png
+│   └── ...
+├── complex/                    # Output images for complex subset
+├── indoor/                     # Output images for indoor subset
+├── outdoor/                    # Output images for outdoor subset
+└── simple/                     # Output images for simple subset
+```
 
 ---
 

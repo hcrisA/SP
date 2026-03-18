@@ -1,3 +1,33 @@
+#!/usr/bin/env python3
+"""
+StereoPilot Model Evaluation Script
+
+Evaluates the base StereoPilot model on the mono2stereo-test dataset.
+Computes PSNR, SSIM, SIoU metrics and inference speed (FPS).
+
+Usage:
+    # Default evaluation (uses mono2stereo-test dataset)
+    python evaluate.py
+
+    # Custom paths
+    python evaluate.py --data_root ../SP_Data/mono2stereo-test --output_folder ../SP_Data/evaluate_output
+
+Output:
+    - evaluation_results.txt: Human-readable results log
+    - metrics_summary.json: Detailed metrics in JSON format
+    - *.png: Generated right-view images for each subset
+
+Output Directory Structure:
+    ../SP_Data/evaluate_output/
+    ├── evaluation_results.txt      # Results log
+    ├── metrics_summary.json        # JSON metrics
+    ├── animation/                  # Output images for animation subset
+    ├── complex/                    # Output images for complex subset
+    ├── indoor/                     # Output images for indoor subset
+    ├── outdoor/                    # Output images for outdoor subset
+    └── simple/                     # Output images for simple subset
+"""
+
 import os
 import sys
 import glob
@@ -167,18 +197,16 @@ def set_config_defaults(config):
 def main():
     parser = argparse.ArgumentParser(description="StereoPilot Evaluation on Mono2Stereo")
     parser.add_argument("--config", type=str, default="toml/infer.toml", help="Config file path")
-    parser.add_argument("--data_root", type=str, default="../SP_Data/mono2stereo_test", help="Root of Mono2Stereo dataset")
-    parser.add_argument("--output_folder", type=str, default="../SP_Data/test_vis_output", help="Output directory name")
+    parser.add_argument("--data_root", type=str, default="../SP_Data/mono2stereo-test", help="Root of Mono2Stereo dataset")
+    parser.add_argument("--output_folder", type=str, default="../SP_Data/evaluate_output", help="Output directory name")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
-    parser.add_argument("--logs_dir", type=str, default="logs", help="Logs directory")
     args = parser.parse_args()
 
-    # Directories
-    output_root = os.path.join(os.getcwd(), args.output_folder)
+    # Directories - 使用相对路径，输出到 ../SP_Data 目录下
+    output_root = args.output_folder
     os.makedirs(output_root, exist_ok=True)
-    os.makedirs(args.logs_dir, exist_ok=True)
     
-    log_file_path = os.path.join(args.logs_dir, '../SP_Data/logs/evaluation_results.txt')
+    log_file_path = os.path.join(output_root, "evaluation_results.txt")
 
     print(f"Loading config from {args.config}")
     if not os.path.exists(args.config):
@@ -243,6 +271,7 @@ def main():
     print(f"Found subsets: {data_subsets}")
     
     total_metrics = {'psnr': 0, 'ssim': 0, 'siou': 0, 'fps': 0, 'count': 0}
+    subset_results = {}  # Store results for each subset
     
     with open(log_file_path, 'w') as log_file:
         log_file.write(f"Evaluation started at {time.ctime()}\n")
@@ -254,7 +283,7 @@ def main():
         
         subset_path_left = os.path.join(args.data_root, subset, 'left')
         subset_path_right = os.path.join(args.data_root, subset, 'right')
-        output_subset_dir = os.path.join(output_root, subset)
+        output_subset_dir = os.path.join(args.output_folder, subset)
         os.makedirs(output_subset_dir, exist_ok=True)
         
         image_files = sorted(glob.glob(os.path.join(subset_path_left, "*")))
@@ -398,6 +427,15 @@ def main():
             total_metrics['siou'] += subset_metrics['siou']
             total_metrics['fps'] += subset_metrics['fps']
             total_metrics['count'] += count
+            
+            # Store subset results
+            subset_results[subset] = {
+                'count': count,
+                'psnr': avg_psnr,
+                'ssim': avg_ssim,
+                'siou': avg_siou,
+                'fps': avg_fps
+            }
         else:
             print(f"Subset {subset} had no valid items processed.")
 
@@ -409,14 +447,42 @@ def main():
         avg_siou = total_metrics['siou'] / count
         avg_fps = total_metrics['fps'] / count
         
-        msg = f"\nOverall Average | Count: {count} | PSNR: {avg_psnr:.4f} | SSIM: {avg_ssim:.4f} | SIoU: {avg_siou:.4f} | FPS: {avg_fps:.2f}"
+        msg = f"\n{'='*80}\nOverall Average | Count: {count} | PSNR: {avg_psnr:.4f} | SSIM: {avg_ssim:.4f} | SIoU: {avg_siou:.4f} | FPS: {avg_fps:.2f}"
         print(msg)
         
         with open(log_file_path, 'a') as log_file:
-            log_file.write("--------------------------------------------------\n")
+            log_file.write("=" * 80 + "\n")
             log_file.write(msg + "\n")
-    
-    print(f"Evaluation Complete. Results saved to {log_file_path}")
+        
+        # Save detailed metrics to JSON
+        metrics_file_path = os.path.join(args.output_folder, "metrics_summary.json")
+        final_results = {
+            'overall': {
+                'count': count,
+                'psnr': avg_psnr,
+                'ssim': avg_ssim,
+                'siou': avg_siou,
+                'fps': avg_fps
+            },
+            'subsets': subset_results,
+            'config': {
+                'data_root': args.data_root,
+                'device': args.device,
+                'sampling_steps': 30,
+                'guide_scale': 5.0,
+                'seed': 42
+            }
+        }
+        
+        with open(metrics_file_path, 'w') as f:
+            json.dump(final_results, f, indent=2)
+        
+        print(f"\nEvaluation Complete!")
+        print(f"Results saved to: {log_file_path}")
+        print(f"Metrics JSON saved to: {metrics_file_path}")
+        print(f"Output images saved to: {args.output_folder}")
+    else:
+        print("No samples were processed successfully.")
 
 if __name__ == "__main__":
     main()
