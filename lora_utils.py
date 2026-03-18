@@ -12,6 +12,28 @@ import math
 import logging
 from typing import List, Dict, Optional, Union
 import re
+from dataclasses import dataclass
+
+
+@dataclass
+class LoRAConfig:
+    """
+    Configuration for LoRA (Low-Rank Adaptation).
+    
+    Attributes:
+        rank: LoRA rank (typically 4-64)
+        alpha: LoRA alpha scaling factor (defaults to rank)
+        dropout: Dropout rate for LoRA layers
+        target_modules: List of module names to inject LoRA into
+    """
+    rank: int = 4
+    alpha: Optional[float] = None
+    dropout: float = 0.0
+    target_modules: Optional[List[str]] = None
+    
+    def __post_init__(self):
+        if self.alpha is None:
+            self.alpha = self.rank
 
 
 class LoRALinear(nn.Module):
@@ -48,6 +70,9 @@ class LoRALinear(nn.Module):
         self.alpha = alpha if alpha is not None else rank
         self.scaling = self.alpha / self.rank
         
+        # Get device from original linear layer
+        device = original_linear.weight.device
+        
         # Freeze original weights
         self.weight = original_linear.weight
         self.bias = original_linear.bias
@@ -56,8 +81,9 @@ class LoRALinear(nn.Module):
             self.bias.requires_grad = False
         
         # LoRA matrices (low rank decomposition: W + BA)
-        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features, dtype=dtype))
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank, dtype=dtype))
+        # Create on the same device as the original layer
+        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features, dtype=dtype, device=device))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank, dtype=dtype, device=device))
         
         # Dropout
         self.lora_dropout = nn.Dropout(p=dropout)
@@ -170,6 +196,12 @@ class LoRAManager:
         filter_func = self.create_module_filter()
         replaced_count = 0
         
+        # Get the device from model's first parameter
+        try:
+            device = next(self.model.parameters()).device
+        except StopIteration:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         # Recursively traverse model and replace modules
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear) and filter_func(name):
@@ -184,6 +216,9 @@ class LoRAManager:
                     dropout=self.dropout,
                     dtype=self.dtype
                 )
+                
+                # Move LoRA module to the same device as the model
+                lora_module = lora_module.to(device)
                 
                 # Replace module
                 parent_name = name.rsplit(".", 1)[0] if "." in name else ""
@@ -200,7 +235,7 @@ class LoRAManager:
                 replaced_count += 1
         
         logger = logging.getLogger(__name__)
-        logger.info(f"✓ Injected LoRA into {replaced_count} modules")
+        logger.info(f"✓ Injected LoRA into {replaced_count} modules on {device}")
         return replaced_count
     
     def get_trainable_parameters(self) -> List[nn.Parameter]:
@@ -220,6 +255,10 @@ class LoRAManager:
                 trainable_params.append(self.model.converge_embedding)
         
         return trainable_params
+    
+    def get_trainable_params_count(self) -> int:
+        """Get total count of trainable parameters."""
+        return sum(p.numel() for p in self.get_trainable_parameters())
     
     def freeze_original_weights(self):
         """
@@ -272,17 +311,42 @@ class LoRAManager:
         Args:
             state_dict: State dict containing LoRA parameters
         """
+        # Get the device from model's first parameter
+        try:
+            device = next(self.model.parameters()).device
+        except StopIteration:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         model_state_dict = self.model.state_dict()
         
         for name, param in state_dict.items():
             if name in model_state_dict:
-                model_state_dict[name].copy_(param)
+                # Move param to the same device as model parameter
+                model_state_dict[name].copy_(param.to(device))
             else:
                 logger = logging.getLogger(__name__)
                 logger.warning(f"Parameter {name} not found in model state dict")
         
         logger = logging.getLogger(__name__)
-        logger.info(f"✓ Loaded LoRA state dict with {len(state_dict)} parameters")
+        logger.info(f"✓ Loaded LoRA state dict with {len(state_dict)} parameters to {device}")
+    
+    def load_lora_weights(self, weights_path: str):
+        """
+        Load LoRA weights from safetensors file.
+        
+        Args:
+            weights_path: Path to .safetensors file containing LoRA weights
+        """
+        import safetensors.torch
+        
+        logger = logging.getLogger(__name__)
+        logger.info(f"Loading LoRA weights from {weights_path}")
+        
+        # Load safetensors file
+        state_dict = safetensors.torch.load_file(weights_path)
+        
+        # Load into model
+        self.load_lora_state_dict(state_dict)
     
     def merge_lora_weights(self):
         """
@@ -349,6 +413,7 @@ import torch.nn.functional as F
 
 # Add import to __all__ if this module is imported elsewhere
 __all__ = [
+    "LoRAConfig",
     "LoRALinear",
     "LoRAManager", 
     "create_lora_config"
